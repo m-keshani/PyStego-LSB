@@ -1,192 +1,259 @@
 import tkinter as tk
-from tkinter import filedialog, messagebox, scrolledtext
-from PIL import Image
+from tkinter import filedialog, messagebox, ttk
+from PIL import Image, ImageTk
+import threading
 import os
 
-# --- Core Steganography Logic ---
-class StegoCore:
+class LSBEngine:
+    """
+    Handles the core logic for LSB (Least Significant Bit) steganography.
+    Supports UTF-8 encoding for multilingual messages.
+    """
     def __init__(self):
-        self.delimiter = "#####END#####"
+        # Unique sequence to mark the end of the message
+        self.stop_delimiter = "#####END#####"
 
-    def _to_bin(self, data):
-        if isinstance(data, str):
-            return ''.join([format(ord(i), "08b") for i in data])
-        raise TypeError("Input must be string.")
+    def _str_to_bin(self, data_str):
+        # Convert string to binary based on UTF-8 code points
+        return ''.join([format(ord(char), "08b") for char in data_str])
 
-    def _bin_to_str(self, binary_data):
-        all_bytes = [binary_data[i: i+8] for i in range(0, len(binary_data), 8)]
-        decoded_data = ""
-        for byte in all_bytes:
-            try:
-                decoded_data += chr(int(byte, 2))
-            except ValueError:
-                continue # Skip invalid bytes
-            if decoded_data.endswith(self.delimiter):
-                return decoded_data[:-len(self.delimiter)]
-        return decoded_data
-
-    def embed_msg(self, img_path, msg, output_path):
+    def encode(self, image_path, message, output_path):
         try:
-            img = Image.open(img_path).convert('RGB')
+            # We convert to RGB to ensure 3 channels (ignoring Alpha for LSB simplicity)
+            img = Image.open(image_path).convert('RGB')
+            pixels = img.load()
             width, height = img.size
-            max_bytes = width * height * 3 // 8
 
-            full_msg = msg + self.delimiter
-            bin_msg = self._to_bin(full_msg)
-            data_len = len(bin_msg)
+            # Append delimiter to know where to stop decoding later
+            full_message = message + self.stop_delimiter
+            binary_msg = self._str_to_bin(full_message)
+            msg_len = len(binary_msg)
 
-            if data_len > width * height * 3:
-                raise ValueError(f"Message too long. Capacity: {max_bytes} bytes.")
+            # Capacity check: each pixel holds 3 bits (R, G, B)
+            max_bytes = (width * height * 3) // 8
+            if msg_len > width * height * 3:
+                raise ValueError(f"Message too large for this image. Max chars: {max_bytes}")
 
-            pixels = list(img.getdata())
-            new_pixels = []
-            idx = 0
-
-            for r, g, b in pixels:
-                if idx < data_len:
-                    r = (r & 0xFE) | int(bin_msg[idx])
-                    idx += 1
-                if idx < data_len:
-                    g = (g & 0xFE) | int(bin_msg[idx])
-                    idx += 1
-                if idx < data_len:
-                    b = (b & 0xFE) | int(bin_msg[idx])
-                    idx += 1
-                new_pixels.append((r, g, b))
-
-            new_img = Image.new(img.mode, img.size)
-            new_img.putdata(new_pixels)
+            data_idx = 0
             
-            # Force PNG for lossless storage
-            if not output_path.lower().endswith('.png'):
-                output_path += '.png'
+            # Iterate through pixels to hide data
+            for y in range(height):
+                for x in range(width):
+                    pixel = list(pixels[x, y])
+                    
+                    # Modify R, G, B values
+                    for n in range(3):
+                        if data_idx < msg_len:
+                            # Bitwise Operation:
+                            # 1. & ~1 : Clears the LSB (sets it to 0)
+                            # 2. | int(...) : Sets LSB to the message bit
+                            pixel[n] = pixel[n] & ~1 | int(binary_msg[data_idx])
+                            data_idx += 1
+                    
+                    pixels[x, y] = tuple(pixel)
+                    if data_idx >= msg_len:
+                        break
+                if data_idx >= msg_len:
+                    break
             
-            new_img.save(output_path)
-            return True, output_path
+            # Must save as PNG to prevent compression artifacts destroying the LSBs
+            img.save(output_path, "PNG")
+            return True, "Encryption successful! Image saved."
+
         except Exception as e:
-            return False, str(e)
+            return False, f"Error during encoding: {str(e)}"
 
-    def extract_msg(self, img_path):
+    def decode(self, image_path):
         try:
-            img = Image.open(img_path).convert('RGB')
-            pixels = list(img.getdata())
-            bin_data = ""
-            for r, g, b in pixels:
-                bin_data += str(r & 1)
-                bin_data += str(g & 1)
-                bin_data += str(b & 1)
+            img = Image.open(image_path).convert('RGB')
+            pixels = img.load()
+            width, height = img.size
             
-            return True, self._bin_to_str(bin_data)
-        except Exception as e:
-            return False, str(e)
+            binary_data = []
+            
+            # Extract LSBs from the image
+            for y in range(height):
+                for x in range(width):
+                    pixel = pixels[x, y]
+                    for n in range(3):
+                        binary_data.append(str(pixel[n] & 1))
 
-# --- GUI Implementation ---
-class App(tk.Tk):
-    def __init__(self):
-        super().__init__()
-        self.title("LSB Steganography Tool")
-        self.geometry("600x500")
-        self.resizable(False, False)
-        self.stego = StegoCore()
-        self.enc_img_path = None
-        self.dec_img_path = None
+            # Reconstruct the string
+            # This approach is simple but might be memory intensive for huge 4k images.
+            # Good enough for a semester project.
+            binary_str = "".join(binary_data)
+            
+            # Split into 8-bit chunks (bytes)
+            bytes_list = [binary_str[i:i+8] for i in range(0, len(binary_str), 8)]
+            
+            decoded_msg = ""
+            for byte in bytes_list:
+                try:
+                    char_code = int(byte, 2)
+                    decoded_msg += chr(char_code)
+                    
+                    # Check for stop delimiter
+                    if decoded_msg.endswith(self.stop_delimiter):
+                        clean_msg = decoded_msg[:-len(self.stop_delimiter)]
+                        return True, clean_msg
+                except:
+                    # If we hit garbage data or invalid chars, just continue
+                    continue
+            
+            return False, "No hidden message found (Delimiter missing)."
+
+        except Exception as e:
+            return False, f"Error during decoding: {str(e)}"
+
+
+class StegoApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("PyStego LSB Tool")
+        self.root.geometry("600x620")
+        self.root.resizable(False, False)
+        
+        # Using 'clam' theme for a cleaner look on Linux/Windows
+        style = ttk.Style()
+        style.theme_use('clam')
+        
+        self.engine = LSBEngine()
+        self.current_img_path = None
 
         self._init_ui()
 
     def _init_ui(self):
-        # Using Notebook for tabs
-        from tkinter import ttk
-        tab_control = ttk.Notebook(self)
-        self.tab_enc = ttk.Frame(tab_control)
-        self.tab_dec = ttk.Frame(tab_control)
-        tab_control.add(self.tab_enc, text='Encrypt (Hide)')
-        tab_control.add(self.tab_dec, text='Decrypt (Reveal)')
-        tab_control.pack(expand=1, fill="both")
+        # Notebook for tabbed interface
+        self.tabs = ttk.Notebook(self.root)
+        self.tab_enc = ttk.Frame(self.tabs)
+        self.tab_dec = ttk.Frame(self.tabs)
+        
+        self.tabs.add(self.tab_enc, text='  Encrypt Message  ')
+        self.tabs.add(self.tab_dec, text='  Decrypt Message  ')
+        self.tabs.pack(expand=1, fill="both", padx=10, pady=10)
+        
+        self._setup_encode_tab()
+        self._setup_decode_tab()
 
-        self._setup_enc_tab()
-        self._setup_dec_tab()
+    def _setup_encode_tab(self):
+        frame = self.tab_enc
+        
+        # Image Selection Section
+        btn_frame = tk.Frame(frame)
+        btn_frame.pack(pady=10)
+        tk.Button(btn_frame, text="Select Source Image", command=self.load_enc_image, 
+                  bg="#007ACC", fg="white", padx=10).pack()
+        
+        self.lbl_enc_preview = tk.Label(frame, text="No Image Selected", bg="#E0E0E0", width=50, height=10)
+        self.lbl_enc_preview.pack(pady=5)
+        
+        self.lbl_enc_path = tk.Label(frame, text="...", fg="gray", font=("Consolas", 8))
+        self.lbl_enc_path.pack()
 
-    def _setup_enc_tab(self):
-        frame = ttk.LabelFrame(self.tab_enc, text="Hide Message in Image", padding=20)
-        frame.pack(fill="both", expand=True, padx=10, pady=10)
-
-        # Image Selection
-        btn_select = ttk.Button(frame, text="Select Base Image", command=self._select_enc_image)
-        btn_select.pack(pady=(0, 5), anchor="w")
-        self.lbl_enc_path = ttk.Label(frame, text="No image selected", wraplength=500, foreground="gray")
-        self.lbl_enc_path.pack(pady=(0, 20), anchor="w")
-
-        # Message Entry
-        ttk.Label(frame, text="Enter Message:").pack(anchor="w")
-        self.txt_msg = scrolledtext.ScrolledText(frame, height=8, width=60)
-        self.txt_msg.pack(pady=(0, 20))
-
+        # Text Input
+        tk.Label(frame, text="Secret Message (Supports Unicode/Persian):", font=("Segoe UI", 10, "bold")).pack(pady=(15, 5))
+        self.txt_input = tk.Text(frame, height=6, width=55, font=("Segoe UI", 10))
+        self.txt_input.pack(pady=5)
+        
         # Action Button
-        self.btn_run_enc = ttk.Button(frame, text="Encrypt & Save As...", command=self._run_encrypt, state="disabled")
-        self.btn_run_enc.pack(anchor="center")
+        tk.Button(frame, text="Encrypt & Save", command=self.run_encode, 
+                  bg="#28A745", fg="white", font=("Segoe UI", 11, "bold"), padx=15).pack(pady=20)
 
-    def _setup_dec_tab(self):
-        frame = ttk.LabelFrame(self.tab_dec, text="Reveal Message from Image", padding=20)
-        frame.pack(fill="both", expand=True, padx=10, pady=10)
+    def _setup_decode_tab(self):
+        frame = self.tab_dec
+        
+        # Image Selection Section
+        tk.Button(frame, text="Select Encrypted Image", command=self.load_dec_image, 
+                  bg="#6f42c1", fg="white", padx=10).pack(pady=10)
+        
+        self.lbl_dec_preview = tk.Label(frame, text="No Image Selected", bg="#E0E0E0", width=50, height=10)
+        self.lbl_dec_preview.pack(pady=5)
 
-        # Image Selection
-        btn_select = ttk.Button(frame, text="Select Stego Image (PNG)", command=self._select_dec_image)
-        btn_select.pack(pady=(0, 5), anchor="w")
-        self.lbl_dec_path = ttk.Label(frame, text="No image selected", wraplength=500, foreground="gray")
-        self.lbl_dec_path.pack(pady=(0, 20), anchor="w")
-
+        self.lbl_dec_path = tk.Label(frame, text="...", fg="gray", font=("Consolas", 8))
+        self.lbl_dec_path.pack()
+        
+        # Output Area
+        tk.Label(frame, text="Decoded Message:", font=("Segoe UI", 10, "bold")).pack(pady=(20, 5))
+        self.txt_output = tk.Text(frame, height=8, width=55, font=("Segoe UI", 10), state='disabled')
+        self.txt_output.pack(pady=5)
+        
         # Action Button
-        self.btn_run_dec = ttk.Button(frame, text="Decrypt Image", command=self._run_decrypt, state="disabled")
-        self.btn_run_dec.pack(pady=(0, 20), anchor="center")
+        tk.Button(frame, text="Extract Message", command=self.run_decode, 
+                  bg="#fd7e14", fg="white", font=("Segoe UI", 11, "bold"), padx=15).pack(pady=20)
 
-        # Result Display
-        ttk.Label(frame, text="Hidden Message:").pack(anchor="w")
-        self.txt_result = scrolledtext.ScrolledText(frame, height=8, width=60, state="disabled")
-        self.txt_result.pack()
-
-    # --- Callbacks ---
-    def _select_enc_image(self):
-        path = filedialog.askopenfilename(filetypes=[("Image Files", "*.jpg *.jpeg *.png *.bmp")])
+    def load_enc_image(self):
+        path = filedialog.askopenfilename(filetypes=[("Image Files", "*.png;*.jpg;*.jpeg;*.bmp")])
         if path:
-            self.enc_img_path = path
-            self.lbl_enc_path.config(text=path, foreground="black")
-            self.btn_run_enc.config(state="normal")
+            self.current_img_path = path
+            self.lbl_enc_path.config(text=os.path.basename(path))
+            self._show_preview(path, self.lbl_enc_preview)
 
-    def _select_dec_image(self):
-        path = filedialog.askopenfilename(filetypes=[("PNG Files", "*.png")])
+    def load_dec_image(self):
+        # We prefer PNG/BMP for decoding as they are lossless
+        path = filedialog.askopenfilename(filetypes=[("Lossless Images", "*.png;*.bmp")])
         if path:
-            self.dec_img_path = path
-            self.lbl_dec_path.config(text=path, foreground="black")
-            self.btn_run_dec.config(state="normal")
+            self.current_img_path = path
+            self.lbl_dec_path.config(text=os.path.basename(path))
+            self._show_preview(path, self.lbl_dec_preview)
 
-    def _run_encrypt(self):
-        msg = self.txt_msg.get("1.0", tk.END).strip()
-        if not msg:
-            messagebox.showwarning("Warning", "Please enter a message.")
+    def _show_preview(self, path, label_widget):
+        try:
+            img = Image.open(path)
+            # Resize for thumbnail preview
+            img.thumbnail((300, 150))
+            photo = ImageTk.PhotoImage(img)
+            label_widget.config(image=photo, width=0, height=0)
+            label_widget.image = photo # Keep reference to avoid GC
+        except Exception as e:
+            print(f"Preview error: {e}")
+
+    def run_encode(self):
+        if not self.current_img_path:
+            messagebox.showwarning("Warning", "Please select an image first.")
             return
         
-        out_path = filedialog.asksaveasfilename(defaultextension=".png", filetypes=[("PNG Image", "*.png")])
-        if out_path:
-            success, result = self.stego.embed_msg(self.enc_img_path, msg, out_path)
-            if success:
-                messagebox.showinfo("Success", f"Image saved to:\n{result}")
-                self.txt_msg.delete("1.0", tk.END)
-            else:
-                messagebox.showerror("Error", result)
+        msg = self.txt_input.get("1.0", tk.END).strip()
+        if not msg:
+            messagebox.showwarning("Warning", "Message is empty.")
+            return
 
-    def _run_decrypt(self):
-        self.txt_result.config(state="normal")
-        self.txt_result.delete("1.0", tk.END)
-        
-        success, result = self.stego.extract_msg(self.dec_img_path)
+        save_path = filedialog.asksaveasfilename(defaultextension=".png", 
+                                                 filetypes=[("PNG Image", "*.png")])
+        if not save_path:
+            return
+
+        # Running in a separate thread to keep UI responsive during processing
+        threading.Thread(target=self._process_encoding, args=(msg, save_path)).start()
+
+    def _process_encoding(self, msg, save_path):
+        success, result_msg = self.engine.encode(self.current_img_path, msg, save_path)
         if success:
-            if not result:
-                 result = "[No valid hidden message found or message is empty]"
-            self.txt_result.insert(tk.INSERT, result)
+            messagebox.showinfo("Success", result_msg)
         else:
-            messagebox.showerror("Error", result)
-        self.txt_result.config(state="disabled")
+            messagebox.showerror("Error", result_msg)
+
+    def run_decode(self):
+        if not self.current_img_path:
+            messagebox.showwarning("Warning", "Please select an image first.")
+            return
+
+        threading.Thread(target=self._process_decoding).start()
+
+    def _process_decoding(self):
+        success, result_msg = self.engine.decode(self.current_img_path)
+        # Tkinter isn't thread-safe, so we schedule UI updates on the main loop
+        self.root.after(0, lambda: self._update_decode_output(success, result_msg))
+
+    def _update_decode_output(self, success, text):
+        self.txt_output.config(state='normal')
+        self.txt_output.delete("1.0", tk.END)
+        self.txt_output.insert("1.0", text)
+        self.txt_output.config(state='disabled')
+        
+        if not success:
+            messagebox.showerror("Extraction Failed", text)
 
 if __name__ == "__main__":
-    app = App()
-    app.mainloop()
+    root = tk.Tk()
+    app = StegoApp(root)
+    root.mainloop()
